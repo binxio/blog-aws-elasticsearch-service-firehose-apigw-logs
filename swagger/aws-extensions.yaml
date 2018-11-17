@@ -1,0 +1,20 @@
+---
+paths:
+  /hello:
+    get:
+      x-amazon-apigateway-integration:
+        responses: {}
+        uri: !Sub arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${HelloFunction.Arn}/invocations
+        credentials: !Sub ${AmazonAPIGatewayInvokeFullAccessRole.Arn}
+        passthroughBehavior: when_no_match
+        httpMethod: POST
+        type: aws_proxy
+  /error:
+    get:
+      x-amazon-apigateway-integration:
+        responses: {}
+        uri: !Sub arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${ErrorFunction.Arn}/invocations
+        credentials: !Sub ${AmazonAPIGatewayInvokeFullAccessRole.Arn}
+        passthroughBehavior: when_no_match
+        httpMethod: POST
+        type: aws_proxy

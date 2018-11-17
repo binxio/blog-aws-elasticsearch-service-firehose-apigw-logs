@@ -1,0 +1,353 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: aws-es-firehose-apigw-access-logs
+
+Resources:
+  DestinationBucket:
+    Type: AWS::S3::Bucket
+
+  ProcessorFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Description: Python Function Handler
+      Handler: index.handler
+      Runtime: python3.6
+      Timeout: 60
+      Role: !GetAtt LambdaBasicExecutionRole.Arn
+      Code:
+        ZipFile: |
+          from base64 import b64encode, b64decode
+          import json
+          import gzip
+
+          def decompress(data):
+              return gzip.decompress(data)
+
+          def decode_record(data: dict) -> dict:
+              x = decompress(b64decode(data['data']))
+              return json.loads(x.decode('utf8'))
+
+          def handler(event, context):
+              records = event['records']
+              for record in records:
+                  record.pop('approximateArrivalTimestamp', None)
+                  decoded = decode_record(record)
+                  if decoded['messageType'] == "DATA_MESSAGE":
+                      print(f'processing: {json.dumps(decoded)}')
+                      event = decoded['logEvents'][0]
+                      event.update({'message': json.loads(event['message'])})
+                      print(f'indexing: {event}')
+                      msg = b64encode(bytes(json.dumps(event), 'utf-8')).decode('ascii')
+                      record.update({'data': msg})
+                      record.update({'result': 'Ok'}) # Ok, Dropped, ProcessingFailed
+                  else:
+                      print(f'dropping: {json.dumps(decoded)}')
+                      record.update({'result': 'Dropped'}) # Ok, Dropped, ProcessingFailed
+
+              print(json.dumps(records))
+              return {'records': records}
+  LambdaBasicExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service: lambda.amazonaws.com
+          Action: sts:AssumeRole
+          Condition: {}
+      Path: /
+      ManagedPolicyArns:
+      - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+
+  DeliverystreamRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service: firehose.amazonaws.com
+          Action: sts:AssumeRole
+          Condition: {}
+      Path: /
+      Policies:
+      - PolicyName: Allow
+        PolicyDocument:
+          Statement:
+          - Effect: Allow
+            Action:
+            - s3:*
+            - kms:*
+            - kinesis:*
+            - logs:*
+            - lambda:*
+            - es:*
+            Resource:
+            - '*'
+
+  Deliverystream:
+    Type: AWS::KinesisFirehose::DeliveryStream
+    Properties:
+      DeliveryStreamType: DirectPut
+      ElasticsearchDestinationConfiguration:
+        BufferingHints:
+          IntervalInSeconds: 60
+          SizeInMBs: 1
+        CloudWatchLoggingOptions:
+          Enabled: true
+          LogGroupName: example-firehose
+          LogStreamName: example-firehose
+        DomainARN: !GetAtt ElasticsearchDomain.DomainArn
+        IndexName: example
+        IndexRotationPeriod: OneHour # NoRotation, OneHour, OneDay, OneWeek, or OneMonth.
+        RetryOptions:
+          DurationInSeconds: 60
+        RoleARN: !GetAtt DeliverystreamRole.Arn
+        S3BackupMode: AllDocuments
+        S3Configuration:
+          BucketARN: !GetAtt DestinationBucket.Arn
+          BufferingHints:
+            IntervalInSeconds: 60
+            SizeInMBs: 1
+          CompressionFormat: UNCOMPRESSED
+          RoleARN: !GetAtt DeliverystreamRole.Arn
+        TypeName: example
+        ProcessingConfiguration:
+          Enabled: true
+          Processors:
+          - Type: Lambda
+            Parameters:
+            - ParameterName: LambdaArn
+              ParameterValue: !GetAtt ProcessorFunction.Arn
+            - ParameterName: RoleArn
+              ParameterValue: !GetAtt DeliverystreamRole.Arn
+            - ParameterName: NumberOfRetries
+              ParameterValue: '3'
+            - ParameterName: BufferSizeInMBs
+              ParameterValue: '1'
+            - ParameterName: BufferIntervalInSeconds
+              ParameterValue: '60'
+
+  CloudWatchLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: example-firehose
+      RetentionInDays: 30
+  CloudWatchLogStream:
+    Type: AWS::Logs::LogStream
+    DependsOn:
+    - CloudWatchLogGroup
+    Properties:
+      LogGroupName: example-firehose
+      LogStreamName: example-firehose
+  LamdaCloudWatchLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/lambda/${ProcessorFunction}
+      RetentionInDays: 30
+
+  ElasticsearchDomain:
+    Type: AWS::Elasticsearch::Domain
+    Properties:
+      ElasticsearchVersion: '6.3'
+      ElasticsearchClusterConfig:
+        InstanceCount: '1'
+        InstanceType: t2.small.elasticsearch
+      EBSOptions:
+        EBSEnabled: 'true'
+        Iops: 0
+        VolumeSize: 10
+        VolumeType: gp2
+      SnapshotOptions:
+        AutomatedSnapshotStartHour: '0'
+      AccessPolicies:
+        Version: 2012-10-17
+        Statement:
+        - Effect: Allow
+          Principal:
+            AWS: '*'
+          Action: es:*
+          Resource: '*'
+      AdvancedOptions:
+        rest.action.multi.allow_explicit_index: 'true'
+
+  AmazonAPIGatewayInvokeFullAccessRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service: apigateway.amazonaws.com
+          Action: sts:AssumeRole
+          Condition: {}
+      Path: /
+      Policies:
+      - PolicyName: ApiGateway
+        PolicyDocument:
+          Statement:
+          - Effect: Allow
+            Action:
+            - lambda:InvokeFunction
+            Resource:
+            - '*'
+
+  CloudWatchLogRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service:
+            - apigateway.amazonaws.com
+          Action: sts:AssumeRole
+      Path: /
+      ManagedPolicyArns:
+      - arn:aws:iam::aws:policy/service-role/AmazonAPIGatewayPushToCloudWatchLogs
+
+  CloudWatchLogSubscriptionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service:
+            - logs.eu-west-1.amazonaws.com
+          Action: sts:AssumeRole
+      Path: /
+      Policies:
+      - PolicyName: Allow
+        PolicyDocument:
+          Statement:
+          - Effect: Allow
+            Action:
+            - firehose:*
+            Resource:
+            - '*'
+      ManagedPolicyArns:
+      - arn:aws:iam::aws:policy/service-role/AmazonAPIGatewayPushToCloudWatchLogs
+
+  Account:
+    Type: AWS::ApiGateway::Account
+    Properties:
+      CloudWatchRoleArn: !GetAtt 'CloudWatchLogRole.Arn'
+
+  HelloFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Handler: index.handler
+      Runtime: python3.6
+      Role: !GetAtt LambdaBasicExecutionRole.Arn
+
+      Code:
+        ZipFile: |
+          import json
+          def handler(event, ctx):
+              return {
+                  'statusCode': 200,
+                  'body': json.dumps('Hello World!')
+              }
+  ErrorFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Handler: index.handler
+      Runtime: python3.6
+      Role: !GetAtt LambdaBasicExecutionRole.Arn
+
+      Code:
+        ZipFile: |
+          def handler(event, ctx):
+              raise ValueError('error_handler always raises an Error')
+
+  ApiGatewayDeployment:
+    Type: AWS::ApiGateway::Deployment
+    Properties:
+      RestApiId: !Ref RestAPIv1
+      StageName: dev
+      StageDescription:
+        DataTraceEnabled: true
+        LoggingLevel: INFO
+        MetricsEnabled: true
+        TracingEnabled: true
+        MethodSettings:
+        - LoggingLevel: INFO
+          ResourcePath: /*
+          HttpMethod: '*'
+
+        AccessLogSetting:
+          DestinationArn: !GetAtt 'CloudWatchAccessLogGroup.Arn'
+          Format: >-
+            {
+            "requestId":"$context.requestId",
+            "ip": "$context.identity.sourceIp",
+            "caller":"$context.identity.caller",
+            "user":"$context.identity.user",
+            "requestTime":"$context.requestTime",
+            "httpMethod":"$context.httpMethod",
+            "resourcePath":"$context.resourcePath",
+            "status":"$context.status",
+            "protocol":"$context.protocol",
+            "responseLength":"$context.responseLength"
+            }
+
+  CloudWatchAccessLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub 'api-gateway-access-logs-dev'
+      RetentionInDays: 30
+
+  CloudWatchLogSubscription:
+    Type: AWS::Logs::SubscriptionFilter
+    Properties:
+      DestinationArn: !GetAtt Deliverystream.Arn
+      FilterPattern: ''
+      LogGroupName: !Ref CloudWatchAccessLogGroup
+      RoleArn: !GetAtt CloudWatchLogSubscriptionRole.Arn
+
+  RestAPIv1:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      EndpointConfiguration:
+        Types:
+        - REGIONAL
+      Body:
+        swagger: '2.0'
+        info:
+          description: blog-aws-es-firehose-apigw-logs
+          title: logs
+          version: 1.0.0
+        schemes:
+        - https
+        paths:
+          /hello:
+            get:
+              x-amazon-apigateway-integration:
+                responses: {}
+                uri: !Sub arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${HelloFunction.Arn}/invocations
+                credentials: !Sub ${AmazonAPIGatewayInvokeFullAccessRole.Arn}
+                passthroughBehavior: when_no_match
+                httpMethod: POST
+                type: aws_proxy
+          /error:
+            get:
+              x-amazon-apigateway-integration:
+                responses: {}
+                uri: !Sub arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${ErrorFunction.Arn}/invocations
+                credentials: !Sub ${AmazonAPIGatewayInvokeFullAccessRole.Arn}
+                passthroughBehavior: when_no_match
+                httpMethod: POST
+                type: aws_proxy
+Outputs:
+  KinesisStreamName:
+    Description: The name of the Deliverystream
+    Value: !Ref Deliverystream
+  KinesisStreamArn:
+    Description: The arn of the Deliverystream
+    Value: !GetAtt Deliverystream.Arn
+  BucketName:
+    Description: THe name of the DestinationBucket
+    Value: !Ref DestinationBucket

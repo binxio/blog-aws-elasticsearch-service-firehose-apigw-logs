@@ -1,0 +1,5 @@
+template_path: templates/elasticsearch.yaml
+hooks:
+  before_delete:
+    - !s3_empty_bucket elasticsearch::BucketName
+    - !s3_delete_bucket elasticsearch::BucketName

@@ -1,0 +1,13 @@
+---
+swagger: '2.0'
+info:
+  description: 'blog-aws-es-firehose-apigw-logs'
+  title: 'logs'
+  version: '1.0.0'
+schemes:
+  - https
+paths:
+  /hello:
+    get:
+  /error:
+    get:
